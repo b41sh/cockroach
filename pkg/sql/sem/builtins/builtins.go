@@ -3003,8 +3003,40 @@ may increase either contention or retry errors, or both.`,
 			Volatility: tree.VolatilityImmutable,
 		}),
 	"levenshtein_less_equal": makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 56820, Category: categoryFuzzyStringMatching}),
-	"metaphone":              makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 56820, Category: categoryFuzzyStringMatching}),
-	"dmetaphone_alt":         makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 56820, Category: categoryFuzzyStringMatching}),
+	"metaphone": makeBuiltin(
+		tree.FunctionProperties{NullableArgs: true, Category: categoryString},
+		tree.Overload{
+			Types:      tree.ArgTypes{{"source", types.String}, {"max_len", types.Int}},
+			ReturnType: tree.FixedReturnType(types.String),
+			Fn: func(evalCtx *tree.EvalContext, args tree.Datums) (tree.Datum, error) {
+				if args[0] == tree.DNull || args[1] == tree.DNull {
+					return tree.NewDString(""), nil
+				}
+				s := string(tree.MustBeDString(args[0]))
+				l := int(tree.MustBeDInt(args[1]))
+				const maxLen = 255
+				if len(s) > maxLen {
+					return nil, pgerror.Newf(pgcode.InvalidParameterValue,
+						"argument exceeds the maximum length of %d bytes", maxLen)
+				}
+				if l > maxLen {
+					return nil, pgerror.Newf(pgcode.InvalidParameterValue,
+						"output exceeds the maximum length of %d bytes", maxLen)
+				} else if l <= 0 {
+					return nil, pgerror.Newf(pgcode.InvalidParameterValue,
+						"output cannot be empty string")
+				}
+				t, err := fuzzystrmatch.Metaphone(s, l)
+				if err != nil {
+					return tree.NewDString(""), err
+				}
+				return tree.NewDString(t), nil
+			},
+			Info:       "Calculate the metaphone code of a source string.",
+			Volatility: tree.VolatilityImmutable,
+		},
+	),
+	"dmetaphone_alt": makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 56820, Category: categoryFuzzyStringMatching}),
 
 	// Trigram functions.
 	"similarity":             makeBuiltin(tree.FunctionProperties{UnsupportedWithIssue: 41285, Category: categoryTrigram}),

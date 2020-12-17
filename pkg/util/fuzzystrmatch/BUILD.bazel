@@ -4,6 +4,7 @@ go_library(
     name = "fuzzystrmatch",
     srcs = [
         "leven.go",
+        "metaphone.go",
         "soundex.go",
     ],
     importpath = "github.com/cockroachdb/cockroach/pkg/util/fuzzystrmatch",
@@ -14,6 +15,7 @@ go_test(
     name = "fuzzystrmatch_test",
     srcs = [
         "leven_test.go",
+        "metaphone_test.go",
         "soundex_test.go",
     ],
     embed = [":fuzzystrmatch"],

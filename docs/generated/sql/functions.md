@@ -2311,6 +2311,8 @@ The swap_ordinate_string parameter is a 2-character string naming the ordinates 
 </span></td></tr>
 <tr><td><a name="md5"></a><code>md5(<a href="string.html">string</a>...) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Calculates the MD5 hash value of a set of values.</p>
 </span></td></tr>
+<tr><td><a name="metaphone"></a><code>metaphone(source: <a href="string.html">string</a>, max_len: <a href="int.html">int</a>) &rarr; <a href="string.html">string</a></code></td><td><span class="funcdesc"><p>Calculate the metaphone code of a source string.</p>
+</span></td></tr>
 <tr><td><a name="octet_length"></a><code>octet_length(val: <a href="bytes.html">bytes</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the number of bytes used to represent <code>val</code>.</p>
 </span></td></tr>
 <tr><td><a name="octet_length"></a><code>octet_length(val: <a href="string.html">string</a>) &rarr; <a href="int.html">int</a></code></td><td><span class="funcdesc"><p>Calculates the number of bytes used to represent <code>val</code>.</p>
