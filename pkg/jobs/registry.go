@@ -513,7 +513,8 @@ func (r *Registry) CreateStartableJobWithTxn(
 	}
 	// Construct a context which contains a tracing span that follows from the
 	// span in the parent context. We don't directly use the parent span because
-	// we want independent lifetimes and cancellation.
+	// we want independent lifetimes and cancellation. For the same reason, we
+	// don't use the Context returned by ForkCtxSpan.
 	resumerCtx, cancel := r.makeCtx()
 	_, span := tracing.ForkCtxSpan(ctx, "job")
 	if span != nil {
@@ -564,6 +565,19 @@ func (r *Registry) LoadJobWithTxn(ctx context.Context, jobID int64, txn *kv.Txn)
 		return nil, err
 	}
 	return j, nil
+}
+
+// UpdateJobWithTxn calls the Update method on an existing job with jobID, using
+// a transaction passed in the txn argument. Passing a nil transaction means
+// that a txn will be automatically created.
+func (r *Registry) UpdateJobWithTxn(
+	ctx context.Context, jobID int64, txn *kv.Txn, updateFunc UpdateFn,
+) error {
+	j := &Job{
+		id:       &jobID,
+		registry: r,
+	}
+	return j.WithTxn(txn).Update(ctx, updateFunc)
 }
 
 // DefaultCancelInterval is a reasonable interval at which to poll this node

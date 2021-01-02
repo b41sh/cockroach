@@ -15,6 +15,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/jobs"
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
@@ -26,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqltelemetry"
 	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
+	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/log/eventpb"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
@@ -273,7 +276,9 @@ func (p *planner) dropTableImpl(
 
 	// Remove foreign key back references from tables that this table has foreign
 	// keys to.
-	for i := range tableDesc.OutboundFKs {
+	// Copy out the set of outbound fks as it may be overwritten in the loop.
+	outboundFKs := append([]descpb.ForeignKeyConstraint(nil), tableDesc.OutboundFKs...)
+	for i := range outboundFKs {
 		ref := &tableDesc.OutboundFKs[i]
 		if err := p.removeFKBackReference(ctx, tableDesc, ref); err != nil {
 			return droppedViews, err
@@ -283,7 +288,9 @@ func (p *planner) dropTableImpl(
 
 	// Remove foreign key forward references from tables that have foreign keys
 	// to this table.
-	for i := range tableDesc.InboundFKs {
+	// Copy out the set of inbound fks as it may be overwritten in the loop.
+	inboundFKs := append([]descpb.ForeignKeyConstraint(nil), tableDesc.InboundFKs...)
+	for i := range inboundFKs {
 		ref := &tableDesc.InboundFKs[i]
 		if err := p.removeFKForBackReference(ctx, tableDesc, ref); err != nil {
 			return droppedViews, err
@@ -321,7 +328,9 @@ func (p *planner) dropTableImpl(
 
 	// Drop all views that depend on this table, assuming that we wouldn't have
 	// made it to this point if `cascade` wasn't enabled.
-	for _, ref := range tableDesc.DependedOnBy {
+	// Copy out the set of dependencies as it may be overwritten in the loop.
+	dependedOnBy := append([]descpb.TableDescriptor_Reference(nil), tableDesc.DependedOnBy...)
+	for _, ref := range dependedOnBy {
 		viewDesc, err := p.getViewDescForCascade(
 			ctx, tableDesc.TypeName(), tableDesc.Name, tableDesc.ParentID, ref.ID, tree.DropCascade,
 		)
@@ -436,6 +445,12 @@ func (p *planner) initiateDropTable(
 	// subsequent schema changes in the transaction (ie. this drop table statement) do not get a cache hit
 	// and do not try to update succeeded jobs, which would raise an error. Instead, this drop table
 	// statement will create a new job to drop the table.
+	//
+	// Note that we still wait for jobs removed from the cache to finish running
+	// after the transaction, since they're not removed from the jobsCollection.
+	// Also, changes made here do not affect schema change jobs created in this
+	// transaction with no mutation ID; they remain in the cache, and will be
+	// updated when writing the job record to drop the table.
 	jobIDs := make(map[int64]struct{})
 	var id descpb.MutationID
 	for _, m := range tableDesc.Mutations {
@@ -449,9 +464,38 @@ func (p *planner) initiateDropTable(
 		}
 	}
 	for jobID := range jobIDs {
-		if err := p.ExecCfg().JobRegistry.Succeeded(ctx, p.txn, jobID); err != nil {
-			return errors.Wrapf(err,
-				"failed to mark job %d as as successful", errors.Safe(jobID))
+		// Mark jobs as succeeded when possible, but be defensive about jobs that
+		// are already in a terminal state or nonexistent. This could happen for
+		// schema change jobs that couldn't be successfully reverted and ended up in
+		// a failed state. Such jobs could have already been GCed from the jobs
+		// table by the time this code runs.
+		mutationJob, err := p.execCfg.JobRegistry.LoadJobWithTxn(ctx, jobID, p.txn)
+		if err != nil {
+			if jobs.HasJobNotFoundError(err) {
+				log.Warningf(ctx, "mutation job %d not found", jobID)
+				continue
+			}
+			return err
+		}
+		if err := mutationJob.WithTxn(p.txn).Update(
+			ctx, func(txn *kv.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+				status := md.Status
+				switch status {
+				case jobs.StatusSucceeded, jobs.StatusCanceled, jobs.StatusFailed:
+					log.Warningf(ctx, "mutation job %d in unexpected state %s", jobID, status)
+					return nil
+				case jobs.StatusRunning, jobs.StatusPending:
+					status = jobs.StatusSucceeded
+				default:
+					// We shouldn't mark jobs as succeeded if they're not in a state where
+					// they're eligible to ever succeed, so mark them as failed.
+					status = jobs.StatusFailed
+				}
+				log.Infof(ctx, "marking mutation job %d for dropped table as %s", jobID, status)
+				ju.UpdateStatus(status)
+				return nil
+			}); err != nil {
+			return errors.Wrap(err, "updating mutation job for dropped table")
 		}
 		delete(p.ExtendedEvalContext().SchemaChangeJobCache, tableDesc.ID)
 	}
@@ -571,7 +615,8 @@ func removeFKBackReferenceFromTable(
 			"for constraint %q on table %q", fkName, originTableDesc.GetName())
 	}
 	// Delete our match.
-	referencedTableDesc.InboundFKs = append(referencedTableDesc.InboundFKs[:matchIdx], referencedTableDesc.InboundFKs[matchIdx+1:]...)
+	referencedTableDesc.InboundFKs = append(referencedTableDesc.InboundFKs[:matchIdx],
+		referencedTableDesc.InboundFKs[matchIdx+1:]...)
 	return nil
 }
 

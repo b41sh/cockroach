@@ -13,8 +13,10 @@ package row
 import (
 	"context"
 
+	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
+	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catalogkv"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/colinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/schemaexpr"
@@ -26,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
+	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/errors"
 )
 
@@ -240,6 +243,49 @@ func TestingSetDatumRowConverterBatchSize(newSize int) func() {
 	}
 }
 
+// getSequenceAnnotation returns a mapping from sequence name to metadata
+// related to the sequence which will be used when evaluating the default
+// expression using the sequence.
+func (c *DatumRowConverter) getSequenceAnnotation(
+	evalCtx *tree.EvalContext, cols []descpb.ColumnDescriptor,
+) (map[string]*SequenceMetadata, error) {
+	// Identify the sequences used in all the columns.
+	sequenceIDs := make(map[descpb.ID]struct{})
+	for _, col := range cols {
+		for _, id := range col.UsesSequenceIds {
+			sequenceIDs[id] = struct{}{}
+		}
+	}
+
+	if len(sequenceIDs) == 0 {
+		return nil, nil
+	}
+
+	var seqNameToMetadata map[string]*SequenceMetadata
+	err := evalCtx.DB.Txn(evalCtx.Context, func(ctx context.Context, txn *kv.Txn) error {
+		seqNameToMetadata = make(map[string]*SequenceMetadata)
+		txn.SetFixedTimestamp(ctx, hlc.Timestamp{WallTime: evalCtx.TxnTimestamp.UnixNano()})
+		for seqID := range sequenceIDs {
+			seqDesc, err := catalogkv.MustGetTableDescByID(ctx, txn, evalCtx.Codec, seqID)
+			if err != nil {
+				return err
+			}
+
+			seqOpts := seqDesc.SequenceOpts
+			if seqOpts == nil {
+				return errors.Newf("descriptor %s is not a sequence", seqDesc.Name)
+			}
+
+			seqNameToMetadata[seqDesc.Name] = &SequenceMetadata{
+				id:      seqID,
+				seqDesc: seqDesc,
+			}
+		}
+		return nil
+	})
+	return seqNameToMetadata, err
+}
+
 // NewDatumRowConverter returns an instance of a DatumRowConverter.
 func NewDatumRowConverter(
 	ctx context.Context,
@@ -247,6 +293,7 @@ func NewDatumRowConverter(
 	targetColNames tree.NameList,
 	evalCtx *tree.EvalContext,
 	kvCh chan<- KVBatch,
+	seqChunkProvider *SeqChunkProvider,
 ) (*DatumRowConverter, error) {
 	c := &DatumRowConverter{
 		tableDesc: tableDesc,
@@ -310,13 +357,25 @@ func NewDatumRowConverter(
 	c.Datums = make([]tree.Datum, len(targetColDescriptors), len(cols))
 	c.defaultCache = make([]tree.TypedExpr, len(cols))
 
+	annot := make(tree.Annotations, 1)
+	var cellInfoAnnot CellInfoAnnotation
+	// Currently, this is only true for an IMPORT INTO CSV.
+	if seqChunkProvider != nil {
+		seqNameToMetadata, err := c.getSequenceAnnotation(evalCtx, c.cols)
+		if err != nil {
+			return nil, err
+		}
+		cellInfoAnnot.seqNameToMetadata = seqNameToMetadata
+		cellInfoAnnot.seqChunkProvider = seqChunkProvider
+	}
+	cellInfoAnnot.uniqueRowIDInstance = 0
+	annot.Set(cellInfoAddr, &cellInfoAnnot)
+	c.EvalCtx.Annotations = &annot
+
 	// Check for a hidden column. This should be the unique_rowid PK if present.
 	// In addition, check for non-targeted columns with non-null DEFAULT expressions.
 	// If the DEFAULT expression is immutable, we can store it in the cache so that it
 	// doesn't have to be reevaluated for every row.
-	annot := make(tree.Annotations, 1)
-	annot.Set(cellInfoAddr, &cellInfoAnnotation{uniqueRowIDInstance: 0})
-	c.EvalCtx.Annotations = &annot
 	for i := range cols {
 		col := &cols[i]
 		if col.DefaultExpr != nil {
@@ -355,7 +414,7 @@ func NewDatumRowConverter(
 		return nil, errors.New("unexpected hidden column")
 	}
 
-	padding := 2 * (len(tableDesc.Indexes) + len(tableDesc.Families))
+	padding := 2 * (len(tableDesc.GetPublicNonPrimaryIndexes()) + len(tableDesc.Families))
 	c.BatchCap = kvDatumRowConverterBatchSize + padding
 	c.KvBatch.KVs = make([]roachpb.KeyValue, 0, c.BatchCap)
 
@@ -391,7 +450,7 @@ const rowIDBits = 64 - builtins.NodeIDBits
 // Row inserts kv operations into the current kv batch, and triggers a SendBatch
 // if necessary.
 func (c *DatumRowConverter) Row(ctx context.Context, sourceID int32, rowIndex int64) error {
-	getCellInfoAnnotation(c.EvalCtx.Annotations).Reset(sourceID, rowIndex)
+	getCellInfoAnnotation(c.EvalCtx.Annotations).reset(sourceID, rowIndex)
 	for i := range c.cols {
 		col := &c.cols[i]
 		if col.DefaultExpr != nil {

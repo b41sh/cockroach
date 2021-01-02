@@ -324,8 +324,6 @@ endif
 vendor_rebuild: bin/.submodules-initialized
 	$(GO_INSTALL) -v -mod=mod github.com/goware/modvendor
 	./build/vendor_rebuild.sh
-	bazel run //:gazelle -- update-repos -from_file=go.mod -build_file_proto_mode=disable -to_macro=DEPS.bzl%go_deps
-	bazel run //:gazelle
 
 # Tell Make to delete the target if its recipe fails. Otherwise, if a recipe
 # modifies its target before failing, the target's timestamp will make it appear
@@ -806,6 +804,7 @@ LOG_TARGETS = \
 	pkg/util/log/severity/severity_generated.go \
 	pkg/util/log/channel/channel_generated.go \
 	pkg/util/log/eventpb/eventlog_channels_generated.go \
+	pkg/util/log/eventpb/json_encode_generated.go \
 	pkg/util/log/log_channels_generated.go
 
 SQLPARSER_TARGETS = \
@@ -823,6 +822,7 @@ DOCGEN_TARGETS := \
 	bin/.docgen_functions \
 	docs/generated/redact_safe.md \
 	bin/.docgen_http \
+	bin/.docgen_logformats \
 	docs/generated/logging.md \
 	docs/generated/eventlog.md
 
@@ -1517,6 +1517,10 @@ bin/.docgen_functions: bin/docgen
 	docgen functions docs/generated/sql --quiet
 	touch $@
 
+bin/.docgen_logformats: bin/docgen
+	docgen logformats docs/generated/logformats.md
+	touch $@
+
 bin/.docgen_http: bin/docgen $(PROTOC)
 	docgen http \
 	--protoc $(PROTOC) \
@@ -1552,7 +1556,11 @@ docs/generated/eventlog.md: pkg/util/log/eventpb/gen.go $(EVENTLOG_PROTOS) | bin
 	mv -f $@.tmp $@
 
 pkg/util/log/eventpb/eventlog_channels_generated.go: pkg/util/log/eventpb/gen.go $(EVENTLOG_PROTOS) | bin/.go_protobuf_sources
-	$(GO) run $(GOFLAGS) $(GOMODVENDORFLAGS) $< eventlog_channels $(EVENTLOG_PROTOS) >$@.tmp || { rm -f $@.tmp; exit 1; }
+	$(GO) run $(GOFLAGS) $(GOMODVENDORFLAGS) $< eventlog_channels_go $(EVENTLOG_PROTOS) >$@.tmp || { rm -f $@.tmp; exit 1; }
+	mv -f $@.tmp $@
+
+pkg/util/log/eventpb/json_encode_generated.go: pkg/util/log/eventpb/gen.go $(EVENTLOG_PROTOS) | bin/.go_protobuf_sources
+	$(GO) run $(GOFLAGS) $(GOMODVENDORFLAGS) $< json_encode_go $(EVENTLOG_PROTOS) >$@.tmp || { rm -f $@.tmp; exit 1; }
 	mv -f $@.tmp $@
 
 docs/generated/logging.md: pkg/util/log/gen.go pkg/util/log/logpb/log.proto
@@ -1687,6 +1695,7 @@ bins = \
   bin/github-pull-request-make \
   bin/gossipsim \
   bin/langgen \
+  bin/dev \
   bin/protoc-gen-gogoroach \
   bin/publish-artifacts \
   bin/publish-provisional-artifacts \

@@ -10,8 +10,7 @@ go_library(
         "//pkg/sql/execinfrapb",
         "//pkg/util/tracing/tracingpb",
         "//pkg/util/uuid",
-        "//vendor/github.com/cockroachdb/errors",
-        "//vendor/github.com/gogo/protobuf/types",
+        "@com_github_cockroachdb_errors//:errors",
     ],
 )
 
@@ -20,9 +19,10 @@ go_test(
     srcs = [
         "main_test.go",
         "traceanalyzer_test.go",
+        "utils_test.go",
     ],
+    embed = [":execstats"],
     deps = [
-        ":execstats",
         "//pkg/base",
         "//pkg/roachpb",
         "//pkg/security",
@@ -37,7 +37,10 @@ go_test(
         "//pkg/testutils/testcluster",
         "//pkg/util/leaktest",
         "//pkg/util/log",
+        "//pkg/util/optional",
         "//pkg/util/tracing",
-        "//vendor/github.com/stretchr/testify/require",
+        "//pkg/util/uuid",
+        "@com_github_stretchr_testify//assert",
+        "@com_github_stretchr_testify//require",
     ],
 )

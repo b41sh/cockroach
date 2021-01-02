@@ -69,6 +69,49 @@ CREATE TABLE multi_col_inv_idx (
 )
 ----
 
+exec-ddl
+CREATE TABLE uniq (
+  k INT PRIMARY KEY,
+  v INT,
+  w INT UNIQUE WITHOUT INDEX,
+  x INT,
+  y INT,
+  z INT UNIQUE,
+  UNIQUE WITHOUT INDEX (x, y)
+)
+----
+
+exec-ddl
+CREATE TABLE computed (
+    a INT PRIMARY KEY,
+    b INT,
+    c INT,
+    d INT AS (c+1) STORED,
+    "x:write-only" INT AS (c+10) STORED,
+    FAMILY (a),
+    FAMILY (b),
+    FAMILY (c),
+    FAMILY (d)
+)
+----
+
+exec-ddl
+CREATE TABLE virt (
+  a INT PRIMARY KEY,
+  b INT,
+  v INT AS (a+b) VIRTUAL
+)
+----
+
+exec-ddl
+CREATE TABLE virt_idx (
+  a INT PRIMARY KEY,
+  b INT,
+  v INT AS (a+b) VIRTUAL,
+  INDEX (v)
+)
+----
+
 # --------------------------------------------------
 # PruneProjectCols
 # --------------------------------------------------
@@ -1937,6 +1980,84 @@ delete a
       ├── key: (6)
       └── fd: (6)-->(9)
 
+# We should not be producing a value for the computed column d, which is not
+# being changed. We should, however, produce a value for the write-only column
+# x even if the column it depends on hasn't changed.
+norm expect=PruneMutationInputCols
+UPDATE computed SET b = b*2 WHERE b = 1
+----
+update computed
+ ├── columns: <none>
+ ├── fetch columns: a:7 b:8 x:11
+ ├── update-mapping:
+ │    ├── b_new:13 => b:2
+ │    └── column15:15 => x:5
+ ├── cardinality: [0 - 0]
+ ├── volatile, mutations
+ └── project
+      ├── columns: column15:15 b_new:13!null a:7!null b:8!null x:11
+      ├── immutable
+      ├── key: (7)
+      ├── fd: ()-->(8,13), (7)-->(11,15)
+      ├── select
+      │    ├── columns: a:7!null b:8!null c:9 x:11
+      │    ├── key: (7)
+      │    ├── fd: ()-->(8), (7)-->(9,11)
+      │    ├── scan computed
+      │    │    ├── columns: a:7!null b:8 c:9 x:11
+      │    │    ├── computed column expressions
+      │    │    │    └── d:10
+      │    │    │         └── c:9 + 1
+      │    │    ├── key: (7)
+      │    │    └── fd: (7)-->(8,9,11)
+      │    └── filters
+      │         └── b:8 = 1 [outer=(8), constraints=(/8: [/1 - /1]; tight), fd=()-->(8)]
+      └── projections
+           ├── c:9 + 10 [as=column15:15, outer=(9), immutable]
+           └── b:8 * 2 [as=b_new:13, outer=(8), immutable]
+
+# We should produce a value for the computed column d.
+norm expect=PruneMutationInputCols
+UPDATE computed SET c = c*2 WHERE b = 1
+----
+update computed
+ ├── columns: <none>
+ ├── fetch columns: a:7 c:9 d:10 x:11
+ ├── update-mapping:
+ │    ├── c_new:13 => c:3
+ │    ├── column14:14 => d:4
+ │    └── column15:15 => x:5
+ ├── cardinality: [0 - 0]
+ ├── volatile, mutations
+ └── project
+      ├── columns: column14:14 column15:15 a:7!null c:9 d:10 x:11 c_new:13
+      ├── immutable
+      ├── key: (7)
+      ├── fd: (7)-->(9-11), (9)-->(13), (13)-->(14,15)
+      ├── project
+      │    ├── columns: c_new:13 a:7!null c:9 d:10 x:11
+      │    ├── immutable
+      │    ├── key: (7)
+      │    ├── fd: (7)-->(9-11), (9)-->(13)
+      │    ├── select
+      │    │    ├── columns: a:7!null b:8!null c:9 d:10 x:11
+      │    │    ├── key: (7)
+      │    │    ├── fd: ()-->(8), (7)-->(9-11)
+      │    │    ├── scan computed
+      │    │    │    ├── columns: a:7!null b:8 c:9 d:10 x:11
+      │    │    │    ├── computed column expressions
+      │    │    │    │    └── d:10
+      │    │    │    │         └── c:9 + 1
+      │    │    │    ├── key: (7)
+      │    │    │    └── fd: (7)-->(8-11)
+      │    │    └── filters
+      │    │         └── b:8 = 1 [outer=(8), constraints=(/8: [/1 - /1]; tight), fd=()-->(8)]
+      │    └── projections
+      │         └── c:9 * 2 [as=c_new:13, outer=(9), immutable]
+      └── projections
+           ├── c_new:13 + 1 [as=column14:14, outer=(13), immutable]
+           └── c_new:13 + 10 [as=column15:15, outer=(13), immutable]
+
 # Do not prune columns that are required for evaluating partial index
 # predicates.
 norm expect-not=PruneMutationFetchCols
@@ -2585,18 +2706,6 @@ upsert checks
            ├── upsert_b:16 > 10 [as=check2:18, outer=(16)]
            └── column2:7 > upsert_b:16 [as=check3:19, outer=(7,16)]
 
-exec-ddl
-CREATE TABLE uniq (
-  k INT PRIMARY KEY,
-  v INT,
-  w INT UNIQUE WITHOUT INDEX,
-  x INT,
-  y INT,
-  z INT UNIQUE,
-  UNIQUE WITHOUT INDEX (x, y)
-)
-----
-
 # Do not prune columns from updates that are needed for unique checks.
 norm expect=PruneMutationInputCols
 UPDATE uniq SET w = 1, x = 2 WHERE k = 3
@@ -2675,6 +2784,90 @@ update uniq
                      ├── y:27 = uniq.y:33 [outer=(27,33), constraints=(/27: (/NULL - ]; /33: (/NULL - ]), fd=(27)==(33), (33)==(27)]
                      └── k:28 != uniq.k:29 [outer=(28,29), constraints=(/28: (/NULL - ]; /29: (/NULL - ])]
 
+# We should be pruning the virtual column.
+norm expect=(PruneMutationFetchCols,PruneMutationInputCols)
+DELETE FROM virt WHERE a > 1
+----
+delete virt
+ ├── columns: <none>
+ ├── fetch columns: a:5
+ ├── cardinality: [0 - 0]
+ ├── volatile, mutations
+ └── select
+      ├── columns: a:5!null
+      ├── key: (5)
+      ├── scan virt
+      │    ├── columns: a:5!null
+      │    ├── computed column expressions
+      │    │    └── v:7
+      │    │         └── a:5 + b:6
+      │    └── key: (5)
+      └── filters
+           └── a:5 > 1 [outer=(5), constraints=(/5: [/2 - ]; tight)]
+
+# We should not be pruning the virtual column if it is used by RETURNING.
+norm
+DELETE FROM virt WHERE a > 1 RETURNING v
+----
+project
+ ├── columns: v:3
+ ├── volatile, mutations
+ └── delete virt
+      ├── columns: a:1!null v:3
+      ├── fetch columns: a:5 v:7
+      ├── volatile, mutations
+      ├── key: (1)
+      ├── fd: (1)-->(3)
+      └── project
+           ├── columns: v:7 a:5!null
+           ├── immutable
+           ├── key: (5)
+           ├── fd: (5)-->(7)
+           ├── select
+           │    ├── columns: a:5!null b:6
+           │    ├── key: (5)
+           │    ├── fd: (5)-->(6)
+           │    ├── scan virt
+           │    │    ├── columns: a:5!null b:6
+           │    │    ├── computed column expressions
+           │    │    │    └── v:7
+           │    │    │         └── a:5 + b:6
+           │    │    ├── key: (5)
+           │    │    └── fd: (5)-->(6)
+           │    └── filters
+           │         └── a:5 > 1 [outer=(5), constraints=(/5: [/2 - ]; tight)]
+           └── projections
+                └── a:5 + b:6 [as=v:7, outer=(5,6), immutable]
+
+# We should not be pruning the virtual column when it is part of an index.
+norm
+DELETE FROM virt_idx WHERE a > 1
+----
+delete virt_idx
+ ├── columns: <none>
+ ├── fetch columns: a:5 v:7
+ ├── cardinality: [0 - 0]
+ ├── volatile, mutations
+ └── project
+      ├── columns: v:7 a:5!null
+      ├── immutable
+      ├── key: (5)
+      ├── fd: (5)-->(7)
+      ├── select
+      │    ├── columns: a:5!null b:6
+      │    ├── key: (5)
+      │    ├── fd: (5)-->(6)
+      │    ├── scan virt_idx
+      │    │    ├── columns: a:5!null b:6
+      │    │    ├── computed column expressions
+      │    │    │    └── v:7
+      │    │    │         └── a:5 + b:6
+      │    │    ├── key: (5)
+      │    │    └── fd: (5)-->(6)
+      │    └── filters
+      │         └── a:5 > 1 [outer=(5), constraints=(/5: [/2 - ]; tight)]
+      └── projections
+           └── a:5 + b:6 [as=v:7, outer=(5,6), immutable]
 
 # ------------------------------------------------------------------------------
 # PruneMutationReturnCols

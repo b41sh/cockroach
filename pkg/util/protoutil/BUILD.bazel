@@ -14,10 +14,10 @@ go_library(
     deps = [
         "//pkg/util/syncutil",
         "//pkg/util/uuid",
-        "//vendor/github.com/cockroachdb/errors",
-        "//vendor/github.com/gogo/protobuf/jsonpb",
-        "//vendor/github.com/gogo/protobuf/proto",
-        "//vendor/github.com/grpc-ecosystem/grpc-gateway/runtime",
+        "@com_github_cockroachdb_errors//:errors",
+        "@com_github_gogo_protobuf//jsonpb",
+        "@com_github_gogo_protobuf//proto",
+        "@com_github_grpc_ecosystem_grpc_gateway//runtime:go_default_library",
     ],
 )
 
@@ -32,6 +32,6 @@ go_test(
         "//pkg/roachpb",
         "//pkg/sql/catalog/descpb",
         "//pkg/storage/enginepb",
-        "//vendor/github.com/gogo/protobuf/proto",
+        "@com_github_gogo_protobuf//proto",
     ],
 )

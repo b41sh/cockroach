@@ -103,6 +103,14 @@ func (rsl StateLoader) Load(
 	}
 	s.TruncatedState = &truncState
 
+	version, err := rsl.LoadVersion(ctx, reader)
+	if err != nil {
+		return kvserverpb.ReplicaState{}, err
+	}
+	if (version != roachpb.Version{}) {
+		s.Version = &version
+	}
+
 	return s, nil
 }
 
@@ -113,6 +121,9 @@ type TruncatedStateType int
 const (
 	// TruncatedStateLegacyReplicated means use the legacy (replicated) key.
 	TruncatedStateLegacyReplicated TruncatedStateType = iota
+	// TruncatedStateLegacyReplicatedAndNoAppliedKey means use the legacy key
+	// and also don't use the RangeAppliedKey. This is for testing use only.
+	TruncatedStateLegacyReplicatedAndNoAppliedKey
 	// TruncatedStateUnreplicated means use the new (unreplicated) key.
 	TruncatedStateUnreplicated
 )
@@ -141,12 +152,17 @@ func (rsl StateLoader) Save(
 	if err := rsl.SetGCThreshold(ctx, readWriter, ms, state.GCThreshold); err != nil {
 		return enginepb.MVCCStats{}, err
 	}
-	if truncStateType == TruncatedStateLegacyReplicated {
+	if truncStateType != TruncatedStateUnreplicated {
 		if err := rsl.SetLegacyRaftTruncatedState(ctx, readWriter, ms, state.TruncatedState); err != nil {
 			return enginepb.MVCCStats{}, err
 		}
 	} else {
 		if err := rsl.SetRaftTruncatedState(ctx, readWriter, state.TruncatedState); err != nil {
+			return enginepb.MVCCStats{}, err
+		}
+	}
+	if state.Version != nil {
+		if err := rsl.SetVersion(ctx, readWriter, ms, state.Version); err != nil {
 			return enginepb.MVCCStats{}, err
 		}
 	}
@@ -505,6 +521,27 @@ func (rsl StateLoader) SetGCThreshold(
 		rsl.RangeLastGCKey(), hlc.Timestamp{}, nil, threshold)
 }
 
+// LoadVersion loads the replica version.
+func (rsl StateLoader) LoadVersion(
+	ctx context.Context, reader storage.Reader,
+) (roachpb.Version, error) {
+	var version roachpb.Version
+	_, err := storage.MVCCGetProto(ctx, reader, rsl.RangeVersionKey(),
+		hlc.Timestamp{}, &version, storage.MVCCGetOptions{})
+	return version, err
+}
+
+// SetVersion sets the replica version.
+func (rsl StateLoader) SetVersion(
+	ctx context.Context,
+	readWriter storage.ReadWriter,
+	ms *enginepb.MVCCStats,
+	version *roachpb.Version,
+) error {
+	return storage.MVCCPutProto(ctx, readWriter, ms,
+		rsl.RangeVersionKey(), hlc.Timestamp{}, nil, version)
+}
+
 // The rest is not technically part of ReplicaState.
 
 // LoadLastIndex loads the last index.
@@ -619,7 +656,7 @@ func (rsl StateLoader) SetHardState(
 
 // SynthesizeRaftState creates a Raft state which synthesizes both a HardState
 // and a lastIndex from pre-seeded data in the engine (typically created via
-// writeInitialReplicaState and, on a split, perhaps the activity of an
+// WriteInitialReplicaState and, on a split, perhaps the activity of an
 // uninitialized Raft group)
 func (rsl StateLoader) SynthesizeRaftState(
 	ctx context.Context, readWriter storage.ReadWriter,

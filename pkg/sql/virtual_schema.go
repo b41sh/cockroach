@@ -176,8 +176,7 @@ func (t virtualSchemaTable) initVirtualTableDesc(
 	if err != nil {
 		return mutDesc.TableDescriptor, err
 	}
-	for i := range mutDesc.Indexes {
-		idx := &mutDesc.Indexes[i]
+	for i, idx := range mutDesc.GetPublicNonPrimaryIndexes() {
 		if len(idx.ColumnIDs) > 1 {
 			panic("we don't know how to deal with virtual composite indexes yet")
 		}
@@ -199,6 +198,7 @@ func (t virtualSchemaTable) initVirtualTableDesc(
 			idx.StoreColumnNames[outputIdx] = mutDesc.Columns[j].Name
 			outputIdx++
 		}
+		mutDesc.SetPublicNonPrimaryIndex(i+1, idx)
 	}
 	return mutDesc.TableDescriptor, nil
 }
@@ -459,15 +459,15 @@ func (e *virtualDefEntry) getPlanInfo(
 
 	constructor := func(ctx context.Context, p *planner, dbName string) (planNode, error) {
 		var dbDesc *dbdesc.Immutable
+		var err error
 		if dbName != "" {
-			dbDescI, err := p.LogicalSchemaAccessor().GetDatabaseDesc(ctx, p.txn, p.ExecCfg().Codec,
+			_, dbDesc, err = p.Descriptors().GetImmutableDatabaseByName(ctx, p.txn,
 				dbName, tree.DatabaseLookupFlags{
 					Required: true, AvoidCached: p.avoidCachedDescriptors,
 				})
 			if err != nil {
 				return nil, err
 			}
-			dbDesc = dbDescI.(*dbdesc.Immutable)
 		} else {
 			if !e.validWithNoDatabaseContext {
 				return nil, errInvalidDbPrefix

@@ -555,6 +555,7 @@ func NewServer(cfg Config, stopper *stop.Stopper) (*Server, error) {
 	lateBoundNode = node
 	roachpb.RegisterInternalServer(grpcServer.Server, node)
 	kvserver.RegisterPerReplicaServer(grpcServer.Server, node.perReplicaServer)
+	kvserver.RegisterPerStoreServer(grpcServer.Server, node.perReplicaServer)
 	node.storeCfg.ClosedTimestamp.RegisterClosedTimestampServer(grpcServer.Server)
 	replicationReporter := reports.NewReporter(
 		db, node.stores, storePool, st, nodeLiveness, internalExecutor)
@@ -1688,6 +1689,10 @@ func (s *Server) PreStart(ctx context.Context) error {
 	s.mux.Handle(loginPath, gwMux)
 	s.mux.Handle(logoutPath, authHandler)
 
+	if s.cfg.EnableDemoLoginEndpoint {
+		s.mux.Handle(DemoLoginPath, http.HandlerFunc(s.authentication.demoLogin))
+	}
+
 	// The /_status/vars endpoint is not authenticated either. Useful for monitoring.
 	s.mux.Handle(statusVars, http.HandlerFunc(s.status.handleVars))
 
@@ -2032,7 +2037,7 @@ func (s *Server) Decommission(
 	} else {
 		panic("unexpected target membership status")
 	}
-	event.CommonDetails().Timestamp = timeutil.Now()
+	event.CommonDetails().Timestamp = timeutil.Now().UnixNano()
 	nodeDetails.RequestingNodeID = int32(s.NodeID())
 
 	for _, nodeID := range nodeIDs {

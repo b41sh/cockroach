@@ -258,10 +258,14 @@ func bootstrapCluster(
 				return splits[i].Less(splits[j])
 			})
 
+			var storeKnobs kvserver.StoreTestingKnobs
+			if kn, ok := initCfg.testingKnobs.Store.(*kvserver.StoreTestingKnobs); ok {
+				storeKnobs = *kn
+			}
 			if err := kvserver.WriteInitialClusterData(
 				ctx, eng, initialValues,
 				bootstrapVersion.Version, len(engines), splits,
-				hlc.UnixNano(),
+				hlc.UnixNano(), storeKnobs,
 			); err != nil {
 				return nil, err
 			}
@@ -797,7 +801,7 @@ func (n *Node) recordJoinEvent(ctx context.Context) {
 		nodeDetails = &ev.CommonNodeEventDetails
 		nodeDetails.LastUp = n.startedAt
 	}
-	event.CommonDetails().Timestamp = timeutil.Now()
+	event.CommonDetails().Timestamp = timeutil.Now().UnixNano()
 	nodeDetails.StartedAt = n.startedAt
 	nodeDetails.NodeID = int32(n.Descriptor.NodeID)
 
@@ -930,20 +934,18 @@ func (n *Node) setupSpanForIncomingRPC(
 	// The operation name matches the one created by the interceptor in the
 	// remoteTrace case below.
 	const opName = "/cockroach.roachpb.Internal/Batch"
+	tr := n.storeCfg.AmbientCtx.Tracer
 	var newSpan, grpcSpan *tracing.Span
 	if isLocalRequest {
 		// This is a local request which circumvented gRPC. Start a span now.
-		ctx, newSpan = tracing.ChildSpan(ctx, opName)
+		ctx, newSpan = tracing.EnsureChildSpan(ctx, tr, opName)
 	} else {
 		grpcSpan = tracing.SpanFromContext(ctx)
 		if grpcSpan == nil {
 			// If tracing information was passed via gRPC metadata, the gRPC interceptor
 			// should have opened a span for us. If not, open a span now (if tracing is
 			// disabled, this will be a noop span).
-			newSpan = n.storeCfg.AmbientCtx.Tracer.StartSpan(
-				opName, tracing.WithLogTags(n.storeCfg.AmbientCtx.LogTags()),
-			)
-			ctx = tracing.ContextWithSpan(ctx, newSpan)
+			ctx, newSpan = tr.StartSpanCtx(ctx, opName)
 		} else {
 			grpcSpan.SetTag("node", n.Descriptor.NodeID)
 		}
@@ -1021,7 +1023,12 @@ func (n *Node) ResetQuorum(
 	// Get range descriptor and save original value of the descriptor for the input range id.
 	var desc roachpb.RangeDescriptor
 	var expValue roachpb.Value
+	txnTries := 0
 	if err := n.storeCfg.DB.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
+		txnTries++
+		if txnTries > 1 {
+			log.Infof(ctx, "failed to retrieve range descriptor for r%d, retrying...", req.RangeID)
+		}
 		kvs, err := sql.ScanMetaKVs(ctx, txn, roachpb.Span{
 			Key:    roachpb.KeyMin,
 			EndKey: roachpb.KeyMax,
@@ -1041,8 +1048,10 @@ func (n *Node) ResetQuorum(
 		}
 		return errors.Errorf("r%d not found", req.RangeID)
 	}); err != nil {
+		log.Errorf(ctx, "range descriptor for r%d could not be read: %v", req.RangeID, err)
 		return nil, err
 	}
+	log.Infof(ctx, "retrieved original range descriptor %s", desc)
 
 	// Check that we've actually lost quorum.
 	livenessMap := n.storeCfg.NodeLiveness.GetIsLiveMap()
@@ -1089,6 +1098,7 @@ func (n *Node) ResetQuorum(
 	if err := n.storeCfg.DB.CPut(ctx, metaKey, &desc, expValue.TagAndDataBytes()); err != nil {
 		return nil, err
 	}
+	log.Infof(ctx, "updated meta2 entry for r%d", desc.RangeID)
 
 	// Set up connection to self. Use rpc.SystemClass to avoid throttling.
 	conn, err := n.storeCfg.NodeDialer.Dial(ctx, n.Descriptor.NodeID, rpc.SystemClass)
@@ -1109,6 +1119,7 @@ func (n *Node) ResetQuorum(
 	); err != nil {
 		return nil, err
 	}
+	log.Infof(ctx, "sent empty snapshot to %s", toReplicaDescriptor)
 
 	return &roachpb.ResetQuorumResponse{}, nil
 }

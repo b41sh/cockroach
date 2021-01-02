@@ -271,6 +271,7 @@ func (tc *testContext) StartWithStoreConfigAndVersion(
 				nil, /* initialValues */
 				bootstrapVersion,
 				1 /* numStores */, nil /* splits */, cfg.Clock.PhysicalNow(),
+				cfg.TestingKnobs,
 			); err != nil {
 				t.Fatal(err)
 			}
@@ -286,14 +287,8 @@ func (tc *testContext) StartWithStoreConfigAndVersion(
 	if realRange {
 		if tc.bootstrapMode == bootstrapRangeOnly {
 			testDesc := testRangeDescriptor()
-			if _, err := stateloader.WriteInitialState(
-				ctx,
-				tc.store.Engine(),
-				enginepb.MVCCStats{},
-				*testDesc,
-				roachpb.Lease{},
-				hlc.Timestamp{},
-				stateloader.TruncatedStateUnreplicated,
+			if err := stateloader.WriteInitialRangeState(
+				ctx, tc.store.Engine(), *testDesc, roachpb.Version{},
 			); err != nil {
 				t.Fatal(err)
 			}
@@ -12484,7 +12479,8 @@ func TestProposalNotAcknowledgedOrReproposedAfterApplication(t *testing.T) {
 	// Hold the RaftLock to ensure that after evalAndPropose our proposal is in
 	// the proposal map. Entries are only removed from that map underneath raft.
 	tc.repl.RaftLock()
-	tracedCtx, cleanup := tracing.EnsureContext(ctx, cfg.AmbientCtx.Tracer, "replica send")
+	sp := cfg.AmbientCtx.Tracer.StartSpan("replica send", tracing.WithForceRealSpan())
+	tracedCtx := tracing.ContextWithSpan(ctx, sp)
 	ch, _, _, pErr := tc.repl.evalAndPropose(tracedCtx, &ba, allSpansGuard(), &lease)
 	if pErr != nil {
 		t.Fatal(pErr)
@@ -12492,7 +12488,7 @@ func TestProposalNotAcknowledgedOrReproposedAfterApplication(t *testing.T) {
 	errCh := make(chan *roachpb.Error)
 	go func() {
 		res := <-ch
-		cleanup()
+		sp.Finish()
 		errCh <- res.Err
 	}()
 
@@ -12573,8 +12569,7 @@ func TestLaterReproposalsDoNotReuseContext(t *testing.T) {
 
 	// Hold the RaftLock to encourage the reproposals to occur in the same batch.
 	tc.repl.RaftLock()
-	sp := tracer.StartSpan("replica send", tracing.WithCtxLogTags(ctx), tracing.WithForceRealSpan())
-	tracedCtx := tracing.ContextWithSpan(ctx, sp)
+	tracedCtx, sp := tracer.StartSpanCtx(ctx, "replica send", tracing.WithForceRealSpan())
 	// Go out of our way to enable recording so that expensive logging is enabled
 	// for this context.
 	sp.SetVerbose(true)

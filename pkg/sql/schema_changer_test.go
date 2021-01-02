@@ -143,7 +143,7 @@ INSERT INTO t.test VALUES ('a', 'b'), ('c', 'd');
 	// Check that RunStateMachineBeforeBackfill functions properly.
 	expectedVersion = tableDesc.Version
 	// Make a copy of the index for use in a mutation.
-	index := protoutil.Clone(&tableDesc.Indexes[0]).(*descpb.IndexDescriptor)
+	index := protoutil.Clone(&tableDesc.GetPublicNonPrimaryIndexes()[0]).(*descpb.IndexDescriptor)
 	index.Name = "bar"
 	index.ID = tableDesc.NextIndexID
 	tableDesc.NextIndexID++
@@ -251,7 +251,7 @@ CREATE INDEX foo ON t.test (v)
 	for r := retry.Start(retryOpts); r.Next(); {
 		tableDesc = catalogkv.TestingGetMutableExistingTableDescriptor(
 			kvDB, keys.SystemSQLCodec, "t", "test")
-		if len(tableDesc.Indexes) == 1 {
+		if len(tableDesc.GetPublicNonPrimaryIndexes()) == 1 {
 			break
 		}
 	}
@@ -278,7 +278,7 @@ CREATE INDEX foo ON t.test (v)
 		// Ensure that the version gets incremented.
 		tableDesc = catalogkv.TestingGetMutableExistingTableDescriptor(
 			kvDB, keys.SystemSQLCodec, "t", "test")
-		name := tableDesc.Indexes[0].Name
+		name := tableDesc.GetPublicNonPrimaryIndexes()[0].Name
 		if name != "ufo" {
 			t.Fatalf("bad index name %s", name)
 		}
@@ -298,7 +298,7 @@ CREATE INDEX foo ON t.test (v)
 	for r := retry.Start(retryOpts); r.Next(); {
 		tableDesc = catalogkv.TestingGetMutableExistingTableDescriptor(
 			kvDB, keys.SystemSQLCodec, "t", "test")
-		if len(tableDesc.Indexes) == count+1 {
+		if len(tableDesc.GetPublicNonPrimaryIndexes()) == count+1 {
 			break
 		}
 	}
@@ -2218,8 +2218,8 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT UNIQUE DEFAULT 23 CREATE FAMILY F3
 
 	// The index is not regenerated.
 	tableDesc := catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	if len(tableDesc.Indexes) > 0 {
-		t.Fatalf("indexes %+v", tableDesc.Indexes)
+	if len(tableDesc.GetPublicNonPrimaryIndexes()) > 0 {
+		t.Fatalf("indexes %+v", tableDesc.GetPublicNonPrimaryIndexes())
 	}
 
 	// Unfortunately this is the same failure present when an index drop
@@ -3078,7 +3078,7 @@ CREATE TABLE t.test (k INT NOT NULL, v INT);
 		if len(tableDesc.Mutations) != 0 {
 			return errors.Errorf("expected 0 mutations after cancellation, found %d", len(tableDesc.Mutations))
 		}
-		if len(tableDesc.PrimaryIndex.ColumnNames) != 1 || tableDesc.PrimaryIndex.ColumnNames[0] != "rowid" {
+		if len(tableDesc.GetPrimaryIndex().ColumnNames) != 1 || tableDesc.GetPrimaryIndex().ColumnNames[0] != "rowid" {
 			return errors.Errorf("expected primary key change to not succeed after cancellation")
 		}
 		return nil
@@ -3579,7 +3579,7 @@ INSERT INTO t.kv VALUES ('a', 'b');
 			name:        `insert-create`,
 			firstStmt:   `INSERT INTO t.kv VALUES ('e', 'f')`,
 			secondStmt:  `CREATE INDEX foo2 ON t.kv (v)`,
-			expectedErr: `schema change statement cannot follow a statement that has written in the same transaction`,
+			expectedErr: `the first schema change statement in a transaction must precede any writes`,
 		},
 		// schema change at the end of a read only transaction.
 		{
@@ -3663,7 +3663,7 @@ CREATE TABLE d.t (
 		kvDB, keys.SystemSQLCodec, "d", "t")
 	// Verify that this descriptor uses the new STORING encoding. Overwrite it
 	// with one that uses the old encoding.
-	for i, index := range tableDesc.Indexes {
+	for i, index := range tableDesc.GetPublicNonPrimaryIndexes() {
 		if len(index.ExtraColumnIDs) != 1 {
 			t.Fatalf("ExtraColumnIDs not set properly: %s", tableDesc)
 		}
@@ -3672,7 +3672,7 @@ CREATE TABLE d.t (
 		}
 		index.ExtraColumnIDs = append(index.ExtraColumnIDs, index.StoreColumnIDs...)
 		index.StoreColumnIDs = nil
-		tableDesc.Indexes[i] = index
+		tableDesc.SetPublicNonPrimaryIndex(i+1, index)
 	}
 	if err := kvDB.Put(
 		context.Background(),
@@ -4109,7 +4109,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT, pi DECIMAL REFERENCES t.pi (d) DE
 	}
 
 	// Ensure that the table data has been deleted.
-	tablePrefix := keys.SystemSQLCodec.IndexPrefix(uint32(tableDesc.ID), uint32(tableDesc.PrimaryIndex.ID))
+	tablePrefix := keys.SystemSQLCodec.IndexPrefix(uint32(tableDesc.ID), uint32(tableDesc.GetPrimaryIndexID()))
 	tableEnd := tablePrefix.PrefixEnd()
 	testutils.SucceedsSoon(t, func() error {
 		if kvs, err := kvDB.Scan(ctx, tablePrefix, tableEnd, 0); err != nil {
@@ -5108,8 +5108,8 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT);
 	}
 
 	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	if len(tableDesc.Indexes) > 0 || len(tableDesc.Mutations) > 0 {
-		t.Fatalf("descriptor broken %d, %d", len(tableDesc.Indexes), len(tableDesc.Mutations))
+	if len(tableDesc.GetPublicNonPrimaryIndexes()) > 0 || len(tableDesc.Mutations) > 0 {
+		t.Fatalf("descriptor broken %d, %d", len(tableDesc.GetPublicNonPrimaryIndexes()), len(tableDesc.Mutations))
 	}
 }
 
@@ -5181,8 +5181,8 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v JSON);
 	}
 
 	tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-	if len(tableDesc.Indexes) > 0 || len(tableDesc.Mutations) > 0 {
-		t.Fatalf("descriptor broken %d, %d", len(tableDesc.Indexes), len(tableDesc.Mutations))
+	if len(tableDesc.GetPublicNonPrimaryIndexes()) > 0 || len(tableDesc.Mutations) > 0 {
+		t.Fatalf("descriptor broken %d, %d", len(tableDesc.GetPublicNonPrimaryIndexes()), len(tableDesc.Mutations))
 	}
 }
 
@@ -5888,7 +5888,7 @@ CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
 	// Wait until indexes are created.
 	for r := retry.Start(retryOpts); r.Next(); {
 		tableDesc = catalogkv.TestingGetTableDescriptor(kvDB, keys.SystemSQLCodec, "t", "test")
-		if len(tableDesc.Indexes) == 1 {
+		if len(tableDesc.GetPublicNonPrimaryIndexes()) == 1 {
 			break
 		}
 	}
@@ -6114,6 +6114,67 @@ SELECT value
 	})
 }
 
+// TestDropTableWhileSchemaChangeReverting tests that schema changes in the
+// reverting state end up as failed when the table is dropped.
+func TestDropTableWhileSchemaChangeReverting(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+	defer setTestJobsAdoptInterval()()
+	ctx := context.Background()
+
+	// Closed when we enter the RunBeforeOnFailOrCancel knob, at which point the
+	// job is in the reverting state.
+	beforeOnFailOrCancelNotification := make(chan struct{})
+	// Closed when we're ready to continue with the schema change (rollback).
+	continueNotification := make(chan struct{})
+	params, _ := tests.CreateTestServerParams()
+	params.Knobs = base.TestingKnobs{
+		SQLSchemaChanger: &sql.SchemaChangerTestingKnobs{
+			RunBeforeOnFailOrCancel: func(_ int64) error {
+				close(beforeOnFailOrCancelNotification)
+				<-continueNotification
+				// Return a retry error, so that we can be sure to test the path where
+				// the job is marked as failed by the DROP TABLE instead of running to
+				// completion and ending up in the failed state on its own.
+				return jobs.NewRetryJobError("injected retry error")
+			},
+		},
+	}
+	s, sqlDB, _ := serverutils.StartServer(t, params)
+	defer s.Stopper().Stop(ctx)
+
+	_, err := sqlDB.Exec(`
+CREATE DATABASE t;
+CREATE TABLE t.test (k INT PRIMARY KEY, v INT8);
+INSERT INTO t.test VALUES (1, 2), (2, 2);
+`)
+	require.NoError(t, err)
+
+	g := ctxgroup.WithContext(ctx)
+	g.GoCtx(func(ctx context.Context) error {
+		// Try to create a unique index which won't be valid and will need a rollback.
+		_, err := sqlDB.Exec(`CREATE UNIQUE INDEX i ON t.test(v);`)
+		assert.Regexp(t, "violates unique constraint", err)
+		return nil
+	})
+
+	<-beforeOnFailOrCancelNotification
+
+	_, err = sqlDB.Exec(`DROP TABLE t.test;`)
+	require.NoError(t, err)
+
+	close(continueNotification)
+	require.NoError(t, g.Wait())
+
+	var status jobs.Status
+	var jobError string
+	require.NoError(t, sqlDB.QueryRow(`
+SELECT status, error FROM crdb_internal.jobs WHERE description LIKE '%CREATE UNIQUE INDEX%'
+`).Scan(&status, &jobError))
+	require.Equal(t, jobs.StatusFailed, status)
+	require.Regexp(t, "violates unique constraint", jobError)
+}
+
 // TestPermanentErrorDuringRollback tests that a permanent error while rolling
 // back a schema change causes the job to fail, and that the appropriate error
 // is displayed in the jobs table.
@@ -6123,7 +6184,7 @@ func TestPermanentErrorDuringRollback(t *testing.T) {
 	defer setTestJobsAdoptInterval()()
 	ctx := context.Background()
 
-	runTest := func(params base.TestServerArgs) {
+	runTest := func(t *testing.T, params base.TestServerArgs, gcJobRecord bool) {
 		s, sqlDB, _ := serverutils.StartServer(t, params)
 		defer s.Stopper().Stop(ctx)
 
@@ -6140,10 +6201,20 @@ CREATE UNIQUE INDEX i ON t.test(v);
 `)
 		require.Regexp(t, "violates unique constraint", err.Error())
 
+		var jobID int64
 		var jobErr string
-		row := sqlDB.QueryRow("SELECT error FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE'")
-		require.NoError(t, row.Scan(&jobErr))
+		row := sqlDB.QueryRow("SELECT job_id, error FROM [SHOW JOBS] WHERE job_type = 'SCHEMA CHANGE'")
+		require.NoError(t, row.Scan(&jobID, &jobErr))
 		require.Regexp(t, "cannot be reverted, manual cleanup may be required: permanent error", jobErr)
+
+		if gcJobRecord {
+			_, err := sqlDB.Exec(`DELETE FROM system.jobs WHERE id = $1`, jobID)
+			require.NoError(t, err)
+		}
+
+		// Test that dropping the table is still possible.
+		_, err = sqlDB.Exec(`DROP TABLE t.test`)
+		require.NoError(t, err)
 	}
 
 	t.Run("error-before-backfill", func(t *testing.T) {
@@ -6168,7 +6239,9 @@ CREATE UNIQUE INDEX i ON t.test(v);
 				},
 			},
 		}
-		runTest(params)
+		// Don't GC the job record after the schema change, so we can test dropping
+		// the table with a failed mutation job.
+		runTest(t, params, false /* gcJobRecord */)
 	})
 
 	t.Run("error-before-reversing-mutations", func(t *testing.T) {
@@ -6193,7 +6266,9 @@ CREATE UNIQUE INDEX i ON t.test(v);
 				},
 			},
 		}
-		runTest(params)
+		// GC the job record after the schema change, so we can test dropping the
+		// table with a nonexistent mutation job.
+		runTest(t, params, true /* gcJobRecord */)
 	})
 }
 
@@ -6315,10 +6390,10 @@ func TestAddingTableResolution(t *testing.T) {
 	// In this test it gets stuck in the adding state.
 	sqlRun.Exec(t, `CREATE MATERIALIZED VIEW foo AS SELECT random(), generate_series FROM generate_series(1, 10);`)
 
-	sqlRun.ExpectErr(t, `pq: table is being added`, `SELECT * FROM foo`)
-	sqlRun.ExpectErr(t, `pq: relation "foo" does not exist`, `ALTER MATERIALIZED VIEW foo RENAME TO bar`)
+	sqlRun.ExpectErr(t, `pq: materialized view "foo" is being added`, `SELECT * FROM foo`)
+	sqlRun.ExpectErr(t, `pq: materialized view "foo" is being added`, `ALTER MATERIALIZED VIEW foo RENAME TO bar`)
 	// Regression test for #52829.
-	sqlRun.ExpectErr(t, `pq: relation "foo" does not exist`, `SHOW CREATE foo`)
+	sqlRun.ExpectErr(t, `pq: materialized view "foo" is being added`, `SHOW CREATE foo`)
 }
 
 // TestFailureToMarkCanceledReversalLeadsToCanceledStatus is a regression test

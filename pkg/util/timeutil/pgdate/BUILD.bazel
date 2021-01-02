@@ -22,7 +22,7 @@ go_library(
         "//pkg/util/errorutil/unimplemented",
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
-        "//vendor/github.com/cockroachdb/errors",
+        "@com_github_cockroachdb_errors//:errors",
     ],
 )
 
@@ -37,6 +37,6 @@ go_test(
     embed = [":pgdate"],
     deps = [
         "//pkg/util/timeutil",
-        "//vendor/github.com/lib/pq",
+        "@com_github_lib_pq//:pq",
     ],
 )

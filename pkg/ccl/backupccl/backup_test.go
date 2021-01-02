@@ -1295,32 +1295,22 @@ func (ip inProgressState) latestJobID() (int64, error) {
 func checkInProgressBackupRestore(
 	t testing.TB, checkBackup inProgressChecker, checkRestore inProgressChecker,
 ) {
-	// To test incremental progress updates, we install a store response filter,
-	// which runs immediately before a KV command returns its response, in our
-	// test cluster. Whenever we see an Export or Import response, we do a
-	// blocking read on the allowResponse channel to give the test a chance to
-	// assert the progress of the job.
 	var allowResponse chan struct{}
 	params := base.TestClusterArgs{}
 	knobs := base.TestingKnobs{
-		DistSQL: &execinfra.TestingKnobs{BackupRestoreTestingKnobs: &sql.BackupRestoreTestingKnobs{RunAfterProcessingRestoreSpanEntry: func(ctx context.Context) {
-			<-allowResponse
-		}}},
-		Store: &kvserver.StoreTestingKnobs{
-			TestingResponseFilter: func(ctx context.Context, ba roachpb.BatchRequest, br *roachpb.BatchResponse) *roachpb.Error {
-				for _, ru := range br.Responses {
-					switch ru.GetInner().(type) {
-					case *roachpb.ExportResponse:
-						<-allowResponse
-					}
-				}
-				return nil
-			},
-		}}
+		DistSQL: &execinfra.TestingKnobs{
+			BackupRestoreTestingKnobs: &sql.BackupRestoreTestingKnobs{
+				RunAfterExportingSpanEntry: func(_ context.Context) {
+					<-allowResponse
+				},
+				RunAfterProcessingRestoreSpanEntry: func(_ context.Context) {
+					<-allowResponse
+				},
+			}},
+	}
 	params.ServerArgs.Knobs = knobs
 
 	const numAccounts = 1000
-	const totalExpectedResponses = backupRestoreDefaultRanges
 
 	ctx, _, sqlDB, dir, cleanup := backupRestoreTestSetupWithParams(t, MultiNode, numAccounts, InitManualReplication, params)
 	conn := sqlDB.DB.(*gosql.DB)
@@ -1328,9 +1318,55 @@ func checkInProgressBackupRestore(
 
 	sqlDB.Exec(t, `CREATE DATABASE restoredb`)
 
+	var totalExpectedBackupRequests int
+	// mergedRangeQuery calculates the number of spans we expect PartitionSpans to
+	// produce. It merges contiguous ranges on the same node.
+	// It sorts ranges by start_key and counts the number of times the
+	// lease_holder changes by comparing against the previous row's lease_holder.
+	mergedRangeQuery := `
+WITH
+	ranges
+		AS (
+			SELECT
+				start_key,
+				lag(lease_holder) OVER (ORDER BY start_key)
+					AS prev_lease_holder,
+				lease_holder
+			FROM
+				[SHOW RANGES FROM TABLE data.bank]
+		)
+SELECT
+	count(*)
+FROM
+	ranges
+WHERE
+	lease_holder != prev_lease_holder
+	OR prev_lease_holder IS NULL;
+`
+
+	sqlDB.QueryRow(t, mergedRangeQuery).Scan(&totalExpectedBackupRequests)
+
 	backupTableID := sqlutils.QueryTableID(t, conn, "data", "public", "bank")
 
 	do := func(query string, check inProgressChecker) {
+		t.Logf("checking query %q", query)
+
+		var totalExpectedResponses int
+		if strings.Contains(query, "BACKUP") {
+			// totalExpectedBackupRequests takes into account the merging that backup
+			// does of co-located ranges. It is the expected number of ExportRequests
+			// backup issues. DistSender will still split those requests to different
+			// ranges on the same node. Each range will write a file, so the number of
+			// SST files this backup will write is `backupRestoreDefaultRanges` .
+			totalExpectedResponses = totalExpectedBackupRequests
+		} else if strings.Contains(query, "RESTORE") {
+			// We expect restore to process each file in the backup individually.
+			// SST files are written per-range in the backup. So we expect the
+			// restore to process #(ranges) that made up the original table.
+			totalExpectedResponses = backupRestoreDefaultRanges
+		} else {
+			t.Fatal("expected query to be either a backup or restore")
+		}
 		jobDone := make(chan error)
 		allowResponse = make(chan struct{}, totalExpectedResponses)
 
@@ -1344,7 +1380,7 @@ func checkInProgressBackupRestore(
 			allowResponse <- struct{}{}
 		}
 
-		err := retry.ForDuration(testutils.DefaultSucceedsSoonDuration, func() error {
+		testutils.SucceedsSoon(t, func() error {
 			return check(ctx, inProgressState{
 				DB:            conn,
 				backupTableID: backupTableID,
@@ -1361,10 +1397,6 @@ func checkInProgressBackupRestore(
 		if err := <-jobDone; err != nil {
 			t.Fatalf("%q: %+v", query, err)
 		}
-
-		if err != nil {
-			t.Fatal(err)
-		}
 	}
 
 	do(`BACKUP DATABASE data TO $1`, checkBackup)
@@ -1373,7 +1405,6 @@ func checkInProgressBackupRestore(
 
 func TestBackupRestoreSystemJobsProgress(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	skip.WithIssue(t, 57831, "flaky test")
 	defer log.Scope(t).Close(t)
 	defer jobs.TestingSetProgressThresholds()()
 
@@ -5893,7 +5924,7 @@ func getMockTableDesc(
 		PrimaryIndex: pkIndex,
 		Indexes:      indexes,
 	}
-	mockImmutableTableDesc := tabledesc.Immutable{TableDescriptor: mockTableDescriptor}
+	mockImmutableTableDesc := tabledesc.MakeImmutable(mockTableDescriptor)
 	return mockImmutableTableDesc
 }
 
@@ -6645,15 +6676,15 @@ CREATE TYPE sc.typ AS ENUM ('hello');
 
 		sqlDB.ExpectErr(t, `database "d" is offline: restoring`, `USE d`)
 
-		sqlDB.ExpectErr(t, `target database or schema does not exist`, `SHOW TABLES FROM d`)
-		sqlDB.ExpectErr(t, `target database or schema does not exist`, `SHOW TABLES FROM d.sc`)
+		sqlDB.ExpectErr(t, `database "d" is offline: restoring`, `SHOW TABLES FROM d`)
+		sqlDB.ExpectErr(t, `database "d" is offline: restoring`, `SHOW TABLES FROM d.sc`)
 
-		sqlDB.ExpectErr(t, `relation "d.sc.tb" does not exist`, `SELECT * FROM d.sc.tb`)
-		sqlDB.ExpectErr(t, `relation "d.sc.tb" does not exist`, `ALTER TABLE d.sc.tb ADD COLUMN b INT`)
+		sqlDB.ExpectErr(t, `database "d" is offline: restoring`, `SELECT * FROM d.sc.tb`)
+		sqlDB.ExpectErr(t, `database "d" is offline: restoring`, `ALTER TABLE d.sc.tb ADD COLUMN b INT`)
 
-		sqlDB.ExpectErr(t, `type "d.sc.typ" does not exist`, `ALTER TYPE d.sc.typ RENAME TO typ2`)
+		sqlDB.ExpectErr(t, `database "d" is offline: restoring`, `ALTER TYPE d.sc.typ RENAME TO typ2`)
 
-		sqlDB.ExpectErr(t, `cannot create "d.sc.other" because the target database or schema does not exist`, `CREATE TABLE d.sc.other()`)
+		sqlDB.ExpectErr(t, `database "d" is offline: restoring`, `CREATE TABLE d.sc.other()`)
 
 		close(continueNotif)
 		require.NoError(t, g.Wait())
@@ -6683,6 +6714,7 @@ CREATE TYPE sc.typ AS ENUM ('hello');
 		sqlDB.Exec(t, `
 CREATE DATABASE d;
 USE d;
+CREATE TABLE tb (x INT);
 CREATE SCHEMA sc;
 CREATE TABLE sc.tb (x INT);
 CREATE TYPE sc.typ AS ENUM ('hello');
@@ -6714,8 +6746,11 @@ CREATE TYPE sc.typ AS ENUM ('hello');
 		schemaDesc := catalogkv.TestingGetSchemaDescriptor(kvDB, keys.SystemSQLCodec, dbDesc.GetID(), "sc")
 		require.Equal(t, descpb.DescriptorState_OFFLINE, schemaDesc.State)
 
-		tableDesc := catalogkv.TestingGetTableDescriptorFromSchema(kvDB, keys.SystemSQLCodec, "newdb", "sc", "tb")
-		require.Equal(t, descpb.DescriptorState_OFFLINE, tableDesc.State)
+		publicTableDesc := catalogkv.TestingGetTableDescriptorFromSchema(kvDB, keys.SystemSQLCodec, "newdb", "public", "tb")
+		require.Equal(t, descpb.DescriptorState_OFFLINE, publicTableDesc.State)
+
+		scTableDesc := catalogkv.TestingGetTableDescriptorFromSchema(kvDB, keys.SystemSQLCodec, "newdb", "sc", "tb")
+		require.Equal(t, descpb.DescriptorState_OFFLINE, scTableDesc.State)
 
 		typeDesc := catalogkv.TestingGetTypeDescriptorFromSchema(kvDB, keys.SystemSQLCodec, "newdb", "sc", "typ")
 		require.Equal(t, descpb.DescriptorState_OFFLINE, typeDesc.State)
@@ -6741,7 +6776,10 @@ CREATE TYPE sc.typ AS ENUM ('hello');
 			{"public", security.AdminRole},
 		})
 
-		sqlDB.ExpectErr(t, `target database or schema does not exist`, `SHOW TABLES FROM newdb.sc`)
+		sqlDB.ExpectErr(t, `schema "sc" is offline: restoring`, `SHOW TABLES FROM newdb.sc`)
+
+		sqlDB.ExpectErr(t, `relation "tb" is offline: restoring`, `SELECT * FROM newdb.tb`)
+		sqlDB.ExpectErr(t, `relation "tb" is offline: restoring`, `SELECT * FROM newdb.public.tb`)
 
 		sqlDB.ExpectErr(t, `schema "sc" is offline: restoring`, `SELECT * FROM newdb.sc.tb`)
 		sqlDB.ExpectErr(t, `schema "sc" is offline: restoring`, `SELECT * FROM sc.tb`)

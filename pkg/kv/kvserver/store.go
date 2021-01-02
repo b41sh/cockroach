@@ -54,6 +54,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/storage/cloud"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
 	"github.com/cockroachdb/cockroach/pkg/util/contextutil"
+	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
@@ -2168,10 +2169,6 @@ func ReadMaxHLCUpperBound(ctx context.Context, engines []storage.Engine) (int64,
 // checkCanInitializeEngine ensures that the engine is empty except for a
 // cluster version, which must be present.
 func checkCanInitializeEngine(ctx context.Context, eng storage.Engine) error {
-	kvs, err := storage.Scan(eng, roachpb.KeyMin, roachpb.KeyMax, 10)
-	if err != nil {
-		return err
-	}
 	// See if this is an already-bootstrapped store.
 	ident, err := ReadStoreIdent(ctx, eng)
 	if err == nil {
@@ -2179,30 +2176,54 @@ func checkCanInitializeEngine(ctx context.Context, eng storage.Engine) error {
 	} else if !errors.HasType(err, (*NotBootstrappedError)(nil)) {
 		return errors.Wrap(err, "unable to read store ident")
 	}
-
-	// Engine is not bootstrapped yet (i.e. no StoreIdent). Does it contain
-	// a cluster version, cached settings and nothing else?
-
-	var sawClusterVersion bool
-	var keyVals []string
-	for _, kv := range kvs {
-		if kv.Key.Key.Equal(keys.StoreClusterVersionKey()) {
-			sawClusterVersion = true
-			continue
-		} else if _, err := keys.DecodeStoreCachedSettingsKey(kv.Key.Key); err == nil {
-			// Cached cluster settings may be present on uninitialized engines.
-			continue
+	// Engine is not bootstrapped yet (i.e. no StoreIdent). Does it contain a
+	// cluster version, cached settings and nothing else? Note that there is one
+	// cluster version key and many cached settings key, and the cluster version
+	// key precedes the cached settings.
+	//
+	// We use an EngineIterator to ensure that there are no keys that cannot be
+	// parsed as MVCCKeys (e.g. lock table keys) in the engine.
+	iter := eng.NewEngineIterator(storage.IterOptions{UpperBound: roachpb.KeyMax})
+	defer iter.Close()
+	valid, err := iter.SeekEngineKeyGE(storage.EngineKey{Key: roachpb.KeyMin})
+	if !valid {
+		if err == nil {
+			return errors.New("no cluster version found on uninitialized engine")
 		}
-		keyVals = append(keyVals, fmt.Sprintf("%s: %q", kv.Key, kv.Value))
+		return err
 	}
-	if len(keyVals) > 0 {
-		return errors.Errorf("engine cannot be bootstrapped, contains:\n%s", keyVals)
+	getMVCCKey := func() (storage.MVCCKey, error) {
+		var k storage.EngineKey
+		k, err = iter.EngineKey()
+		if err != nil {
+			return storage.MVCCKey{}, err
+		}
+		if !k.IsMVCCKey() {
+			return storage.MVCCKey{}, errors.Errorf("found non-mvcc key: %s", k)
+		}
+		return k.ToMVCCKey()
 	}
-	if !sawClusterVersion {
+	var k storage.MVCCKey
+	if k, err = getMVCCKey(); err != nil {
+		return err
+	}
+	if !k.Key.Equal(keys.StoreClusterVersionKey()) {
 		return errors.New("no cluster version found on uninitialized engine")
 	}
-
-	return nil
+	valid, err = iter.NextEngineKey()
+	for valid {
+		// Only allowed to find cached cluster settings on an uninitialized
+		// engine.
+		if k, err = getMVCCKey(); err != nil {
+			return err
+		}
+		if _, err := keys.DecodeStoreCachedSettingsKey(k.Key); err != nil {
+			return errors.Errorf("engine cannot be bootstrapped, contains key:\n%s", k.String())
+		}
+		// There may be more cached cluster settings, so continue iterating.
+		valid, err = iter.NextEngineKey()
+	}
+	return err
 }
 
 // GetReplica fetches a replica by Range ID. Returns an error if no replica is found.
@@ -2775,6 +2796,58 @@ func (s *Store) ManuallyEnqueue(
 	processed, processErr := queue.process(ctx, repl, sysCfg)
 	log.Eventf(ctx, "processed: %t", processed)
 	return collect(), processErr, nil
+}
+
+// PurgeOutdatedReplicas purges all replicas with a version less than the one
+// specified. This entails clearing out replicas in the replica GC queue that
+// fit the bill.
+func (s *Store) PurgeOutdatedReplicas(ctx context.Context, version roachpb.Version) error {
+	if interceptor := s.TestingKnobs().PurgeOutdatedReplicasInterceptor; interceptor != nil {
+		interceptor()
+	}
+
+	// Let's set a reasonable bound on the number of replicas being processed in
+	// parallel.
+	qp := quotapool.NewIntPool("purge-outdated-replicas", 50)
+	g := ctxgroup.WithContext(ctx)
+	s.VisitReplicas(func(repl *Replica) (wantMore bool) {
+		if !repl.Version().Less(version) {
+			// Nothing to do here.
+			return true
+		}
+
+		alloc, err := qp.Acquire(ctx, 1)
+		if err != nil {
+			g.GoCtx(func(ctx context.Context) error {
+				return err
+			})
+			return false
+		}
+
+		g.GoCtx(func(ctx context.Context) error {
+			defer alloc.Release()
+
+			processed, err := s.replicaGCQueue.process(ctx, repl, nil)
+			if err != nil {
+				return errors.Wrapf(err, "on %s", repl.Desc())
+			}
+			if !processed {
+				// We're either still part of the raft group, in which same
+				// something has gone horribly wrong, or more likely (though
+				// still very unlikely in practice): this range has been merged
+				// away, and this store has the replica of the subsuming range
+				// where we're unable to determine if it has applied the merge
+				// trigger. See replicaGCQueue.process for more details. Either
+				// way, we error out.
+				return errors.Newf("unable to gc %s", repl.Desc())
+			}
+			return nil
+		})
+
+		return true
+	})
+
+	return g.Wait()
 }
 
 // WriteClusterVersion writes the given cluster version to the store-local

@@ -16,6 +16,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
+	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -123,7 +125,9 @@ type TableDescriptor interface {
 	GetIndexMutationCapabilities(id descpb.IndexID) (isMutation, isWriteOnly bool)
 	KeysPerRow(id descpb.IndexID) (int, error)
 	PartialIndexOrds() util.FastIntSet
+	WritableIndexes() []descpb.IndexDescriptor
 	DeletableIndexes() []descpb.IndexDescriptor
+	DeleteOnlyIndexes() []descpb.IndexDescriptor
 
 	HasPrimaryKey() bool
 	PrimaryKeyString() string
@@ -142,6 +146,10 @@ type TableDescriptor interface {
 	ColumnsWithMutations(includeMutations bool) []descpb.ColumnDescriptor
 	ColumnIdxMapWithMutations(includeMutations bool) TableColMap
 	DeletableColumns() []descpb.ColumnDescriptor
+	MutationColumns() []descpb.ColumnDescriptor
+	ContainsUserDefinedTypes() bool
+	GetColumnOrdinalsWithUserDefinedTypes() []int
+	UserDefinedTypeColsHaveSameVersion(otherDesc TableDescriptor) bool
 
 	GetFamilies() []descpb.ColumnFamilyDescriptor
 	NumFamilies() int
@@ -190,6 +198,7 @@ type TypeDescriptor interface {
 	GetIDClosure() map[descpb.ID]struct{}
 
 	PrimaryRegion() (descpb.Region, error)
+	Validate(ctx context.Context, dg DescGetter) error
 }
 
 // TypeDescriptorResolver is an interface used during hydration of type
@@ -216,7 +225,9 @@ func FilterDescriptorState(desc Descriptor, flags tree.CommonLookupFlags) error 
 		}
 		return NewInactiveDescriptorError(err)
 	case desc.Adding():
-		return errTableAdding
+		// Only table descriptors can be in the adding state.
+		return pgerror.WithCandidateCode(newAddingTableError(desc.(TableDescriptor)),
+			pgcode.ObjectNotInPrerequisiteState)
 	default:
 		return nil
 	}

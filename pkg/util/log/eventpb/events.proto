@@ -24,10 +24,11 @@ import "google/protobuf/timestamp.proto";
 
 // CommonEventDetails contains the fields common to all events.
 message CommonEventDetails {
-  // The timestamp of the event.
-  google.protobuf.Timestamp timestamp = 1 [(gogoproto.nullable) = false, (gogoproto.stdtime) = true, (gogoproto.jsontag) = ",omitempty"];
+  // The timestamp of the event. Expressed as nanoseconds since
+  // the Unix epoch.
+  int64 timestamp = 1 [(gogoproto.jsontag) = ",omitempty"];
   // The type of the event.
-  string event_type = 2 [(gogoproto.jsontag) = ",omitempty"];
+  string event_type = 2 [(gogoproto.jsontag) = ",omitempty", (gogoproto.moretags) = "redact:\"nonsensitive\""];
 }
 
 // CommonSQLEventDetails contains the fields common to all
@@ -42,5 +43,10 @@ message CommonSQLEventDetails {
   // The primary object descriptor affected by the operation. Set to zero for operations
   // that don't affect descriptors.
   uint32 descriptor_id = 3 [(gogoproto.customname) = "DescriptorID" , (gogoproto.jsontag) = ",omitempty"];
+
+  // The application name for the session where the event was emitted.
+  // This is included in the event to ease filtering of logging output
+  // by application.
+  string application_name = 4 [(gogoproto.jsontag) = ",omitempty"];
 }
 

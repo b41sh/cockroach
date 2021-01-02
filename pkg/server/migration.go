@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 )
 
@@ -39,6 +40,10 @@ var _ serverpb.MigrationServer = &migrationServer{}
 func (m *migrationServer) ValidateTargetClusterVersion(
 	ctx context.Context, req *serverpb.ValidateTargetClusterVersionRequest,
 ) (*serverpb.ValidateTargetClusterVersionResponse, error) {
+	ctx, span := m.server.AnnotateCtxWithSpan(ctx, "validate-cluster-version")
+	defer span.Finish()
+	ctx = logtags.AddTag(ctx, "validate-cluster-version", nil)
+
 	targetCV := req.ClusterVersion
 	versionSetting := m.server.ClusterSettings().Version
 
@@ -81,6 +86,10 @@ func (m *migrationServer) ValidateTargetClusterVersion(
 func (m *migrationServer) BumpClusterVersion(
 	ctx context.Context, req *serverpb.BumpClusterVersionRequest,
 ) (*serverpb.BumpClusterVersionResponse, error) {
+	ctx, span := m.server.AnnotateCtxWithSpan(ctx, "bump-cluster-version")
+	defer span.Finish()
+	ctx = logtags.AddTag(ctx, "bump-cluster-version", nil)
+
 	m.Lock()
 	defer m.Unlock()
 
@@ -132,5 +141,51 @@ func (m *migrationServer) BumpClusterVersion(
 	}
 
 	resp := &serverpb.BumpClusterVersionResponse{}
+	return resp, nil
+}
+
+// SyncAllEngines implements the MigrationServer interface.
+func (m *migrationServer) SyncAllEngines(
+	ctx context.Context, _ *serverpb.SyncAllEnginesRequest,
+) (*serverpb.SyncAllEnginesResponse, error) {
+	ctx, span := m.server.AnnotateCtxWithSpan(ctx, "sync-all-engines")
+	defer span.Finish()
+	ctx = logtags.AddTag(ctx, "sync-all-engines", nil)
+
+	// Let's be paranoid here and ensure that all stores have been fully
+	// initialized.
+	m.server.node.waitForAdditionalStoreInit()
+
+	for _, eng := range m.server.engines {
+		batch := eng.NewBatch()
+		if err := batch.LogData(nil); err != nil {
+			return nil, err
+		}
+	}
+
+	log.Infof(ctx, "synced %d engines", len(m.server.engines))
+	resp := &serverpb.SyncAllEnginesResponse{}
+	return resp, nil
+}
+
+// PurgeOutdatedReplicas implements the MigrationServer interface.
+func (m *migrationServer) PurgeOutdatedReplicas(
+	ctx context.Context, req *serverpb.PurgeOutdatedReplicasRequest,
+) (*serverpb.PurgeOutdatedReplicasResponse, error) {
+	ctx, span := m.server.AnnotateCtxWithSpan(ctx, "purged-outdated-replicas")
+	defer span.Finish()
+	ctx = logtags.AddTag(ctx, "purge-outdated-replicas", nil)
+
+	// Same as in SyncAllEngines, because stores can be added asynchronously, we
+	// need to ensure that the bootstrap process has happened.
+	m.server.node.waitForAdditionalStoreInit()
+
+	if err := m.server.node.stores.VisitStores(func(s *kvserver.Store) error {
+		return s.PurgeOutdatedReplicas(ctx, *req.Version)
+	}); err != nil {
+		return nil, err
+	}
+
+	resp := &serverpb.PurgeOutdatedReplicasResponse{}
 	return resp, nil
 }

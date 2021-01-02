@@ -357,14 +357,6 @@ func (sc *SchemaChanger) dropConstraints(
 		if err != nil {
 			return err
 		}
-		// TODO(ajwerner): The need to do this implies that we should cache all
-		// mutable descriptors inside of the collection when they are resolved
-		// such that all attempts to resolve a mutable descriptor from a
-		// collection will always give you the same exact pointer.
-		scTable.MaybeIncrementVersion()
-		if err := descsCol.AddUncommittedDescriptor(scTable); err != nil {
-			return err
-		}
 		b := txn.NewBatch()
 		for i := range constraints {
 			constraint := &constraints[i]
@@ -490,14 +482,7 @@ func (sc *SchemaChanger) addConstraints(
 		if err != nil {
 			return err
 		}
-		// TODO(ajwerner): The need to do this implies that we should cache all
-		// mutable descriptors inside of the collection when they are resolved
-		// such that all attempts to resolve a mutable descriptor from a
-		// collection will always give you the same exact pointer.
-		scTable.MaybeIncrementVersion()
-		if err := descsCol.AddUncommittedDescriptor(scTable); err != nil {
-			return err
-		}
+
 		b := txn.NewBatch()
 		for i := range constraints {
 			constraint := &constraints[i]
@@ -733,7 +718,7 @@ func TruncateInterleavedIndexes(
 			resumeAt := resume
 			// Make a new txn just to drop this chunk.
 			if err := db.Txn(ctx, func(ctx context.Context, txn *kv.Txn) error {
-				rd := row.MakeDeleter(codec, table, nil)
+				rd := row.MakeDeleter(codec, table, nil /* requestedCols */)
 				td := tableDeleter{rd: rd, alloc: alloc}
 				if err := td.init(ctx, txn, nil /* *tree.EvalContext */); err != nil {
 					return err
@@ -804,7 +789,7 @@ func (sc *SchemaChanger) truncateIndexes(
 				if err != nil {
 					return err
 				}
-				rd := row.MakeDeleter(sc.execCfg.Codec, tableDesc, nil)
+				rd := row.MakeDeleter(sc.execCfg.Codec, tableDesc, nil /* requestedCols */)
 				td := tableDeleter{rd: rd, alloc: alloc}
 				if err := td.init(ctx, txn, nil /* *tree.EvalContext */); err != nil {
 					return err
@@ -1421,7 +1406,7 @@ func (sc *SchemaChanger) validateForwardIndexes(
 
 			// Force the primary index so that the optimizer does not create a
 			// query plan that uses the indexes being backfilled.
-			query := fmt.Sprintf(`SELECT count(1)%s FROM [%d AS t]@[%d]`, partialIndexCounts, desc.ID, desc.PrimaryIndex.ID)
+			query := fmt.Sprintf(`SELECT count(1)%s FROM [%d AS t]@[%d]`, partialIndexCounts, desc.ID, desc.GetPrimaryIndexID())
 
 			cnt, err := ie.QueryRowEx(ctx, "VERIFY INDEX", txn, sessiondata.InternalExecutorOverride{}, query)
 			if err != nil {
@@ -1963,7 +1948,7 @@ func indexTruncateInTxn(
 	alloc := &rowenc.DatumAlloc{}
 	var sp roachpb.Span
 	for done := false; !done; done = sp.Key == nil {
-		rd := row.MakeDeleter(execCfg.Codec, tableDesc, nil)
+		rd := row.MakeDeleter(execCfg.Codec, tableDesc, nil /* requestedCols */)
 		td := tableDeleter{rd: rd, alloc: alloc}
 		if err := td.init(ctx, txn, evalCtx); err != nil {
 			return err

@@ -293,12 +293,16 @@ type Reader interface {
 	// to an SST that exceeds maxSize, an error will be returned. This parameter
 	// exists to prevent creating SSTs which are too large to be used.
 	//
+	// If useTBI is true, the backing MVCCIncrementalIterator will initialize a
+	// time-bound iterator along with its regular iterator. The TBI will be used
+	// as an optimization to skip over swaths of uninteresting keys i.e. keys
+	// outside our time bounds, while locating the KVs to export.
+	//
 	// This function looks at MVCC versions and intents, and returns an error if an
 	// intent is found.
 	ExportMVCCToSst(
 		startKey, endKey roachpb.Key, startTS, endTS hlc.Timestamp,
-		exportAllRevisions bool, targetSize uint64, maxSize uint64,
-		io IterOptions,
+		exportAllRevisions bool, targetSize uint64, maxSize uint64, useTBI bool,
 	) (sst []byte, _ roachpb.BulkOpSummary, resumeKey roachpb.Key, _ error)
 	// Get returns the value for the given key, nil otherwise. Semantically, it
 	// behaves as if an iterator with MVCCKeyAndIntentsIterKind was used.
@@ -645,6 +649,10 @@ type Engine interface {
 
 // Batch is the interface for batch specific operations.
 type Batch interface {
+	// Iterators created on a batch can see some mutations performed after the
+	// iterator creation. To guarantee that they see all the mutations, the
+	// iterator has to be repositioned using a seek operation, after the
+	// mutations were done.
 	ReadWriter
 	// Commit atomically applies any batched updates to the underlying
 	// engine. This is a noop unless the batch was created via NewBatch(). If
@@ -669,6 +677,12 @@ type Batch interface {
 	//
 	// TODO(itsbilal): Improve comments around how/why distinct batches are an
 	// optimization in the rocksdb write path.
+	//
+	// TODO(sumeer): Most Distinct() batches are being created on Pebble indexed
+	// batches, so the comment about only seeing writes before the batch was
+	// created is incorrect. See discussion in
+	// https://github.com/cockroachdb/pebble/issues/943
+	// https://github.com/cockroachdb/cockroach/pull/57661
 	Distinct() ReadWriter
 	// Empty returns whether the batch has been written to or not.
 	Empty() bool
@@ -785,9 +799,11 @@ func PutProto(
 	return int64(MVCCKey{Key: key}.EncodedSize()), int64(len(bytes)), nil
 }
 
-// Scan returns up to max key/value objects starting from
-// start (inclusive) and ending at end (non-inclusive).
-// Specify max=0 for unbounded scans.
+// Scan returns up to max key/value objects starting from start (inclusive)
+// and ending at end (non-inclusive). Specify max=0 for unbounded scans. Since
+// this code may use an intentInterleavingIter, the caller should not attempt
+// a single scan to span local and global keys. See the comment in the
+// declaration of intentInterleavingIter for details.
 func Scan(reader Reader, start, end roachpb.Key, max int64) ([]MVCCKeyValue, error) {
 	var kvs []MVCCKeyValue
 	err := reader.MVCCIterate(start, end, MVCCKeyAndIntentsIterKind, func(kv MVCCKeyValue) error {

@@ -411,6 +411,7 @@ func TestParse(t *testing.T) {
 		{`ANALYZE db.sc.t`},
 
 		{`CREATE TYPE a AS ENUM ()`},
+		{`CREATE TYPE IF NOT EXISTS a AS ENUM ()`},
 		{`CREATE TYPE a AS ENUM ('a')`},
 		{`CREATE TYPE a AS ENUM ('a', 'b', 'c')`},
 		{`CREATE TYPE a.b AS ENUM ('a', 'b', 'c')`},
@@ -552,6 +553,8 @@ func TestParse(t *testing.T) {
 
 		{`EXPLAIN SELECT 1`},
 		{`EXPLAIN EXPLAIN SELECT 1`},
+		{`EXPLAIN (DISTSQL) SELECT 1`},
+		{`EXPLAIN (DISTSQL, JSON) SELECT 1`},
 		{`EXPLAIN (OPT, VERBOSE) SELECT 1`},
 		{`EXPLAIN ANALYZE (DISTSQL) SELECT 1`},
 		{`EXPLAIN ANALYZE (DEBUG) SELECT 1`},

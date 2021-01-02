@@ -1330,10 +1330,6 @@ func (ef *execFactory) ConstructUpdate(
 		return nil, err
 	}
 
-	// Truncate any FetchCols added by MakeUpdater. The optimizer has already
-	// computed a correct set that can sometimes be smaller.
-	ru.FetchCols = ru.FetchCols[:len(fetchColDescs)]
-
 	// updateColsIdx inverts the mapping of UpdateCols to FetchCols. See
 	// the explanatory comments in updateRun.
 	var updateColsIdx catalog.TableColMap
@@ -1448,10 +1444,6 @@ func (ef *execFactory) ConstructUpsert(
 		return nil, err
 	}
 
-	// Truncate any FetchCols added by MakeUpdater. The optimizer has already
-	// computed a correct set that can sometimes be smaller.
-	ru.FetchCols = ru.FetchCols[:len(fetchColDescs)]
-
 	// Instantiate the upsert node.
 	ups := upsertNodePool.Get().(*upsertNode)
 	*ups = upsertNode{
@@ -1520,10 +1512,6 @@ func (ef *execFactory) ConstructDelete(
 	// those sets into the deleter (which will basically be a no-op).
 	rd := row.MakeDeleter(ef.planner.ExecCfg().Codec, tabDesc, fetchColDescs)
 
-	// Truncate any FetchCols added by MakeUpdater. The optimizer has already
-	// computed a correct set that can sometimes be smaller.
-	rd.FetchCols = rd.FetchCols[:len(fetchColDescs)]
-
 	// Now make a delete node. We use a pool.
 	del := deleteNodePool.Get().(*deleteNode)
 	*del = deleteNode{
@@ -1569,7 +1557,7 @@ func (ef *execFactory) ConstructDeleteRange(
 	autoCommit bool,
 ) (exec.Node, error) {
 	tabDesc := table.(*optTable).desc
-	indexDesc := &tabDesc.PrimaryIndex
+	indexDesc := tabDesc.GetPrimaryIndex()
 	sb := span.MakeBuilder(ef.planner.EvalContext(), ef.planner.ExecCfg().Codec, tabDesc, indexDesc)
 
 	if err := ef.planner.maybeSetSystemConfig(tabDesc.GetID()); err != nil {
@@ -1882,14 +1870,18 @@ func (ef *execFactory) ConstructExplain(
 	if err != nil {
 		return nil, err
 	}
-	if options.Mode != tree.ExplainPlan {
+	if options.Mode == tree.ExplainVec {
 		wrappedPlan := plan.(*explain.Plan).WrappedPlan.(*planComponents)
-		return constructExplainDistSQLOrVecNode(options, stmtType, wrappedPlan, ef.planner)
+		return &explainVecNode{
+			options: options,
+			plan:    *wrappedPlan,
+		}, nil
 	}
 	flags := explain.MakeFlags(options)
 	n := &explainPlanNode{
-		flags: flags,
-		plan:  plan.(*explain.Plan),
+		options: options,
+		flags:   flags,
+		plan:    plan.(*explain.Plan),
 	}
 	return n, nil
 }
